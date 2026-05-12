@@ -242,7 +242,7 @@ def get_use_audio_in_video_query() -> QueryResult:
             "prompt": prompt,
             "multi_modal_data": {
                 "video": asset.np_ndarrays,
-                "audio": (audio, 16000),
+                "audio": audio,
             },
             "mm_processor_kwargs": {
                 "use_audio_in_video": True,
@@ -295,7 +295,10 @@ def main(args):
     else:
         query_result = query_func()
 
-    omni = Omni.from_cli_args(args, model=model_name)
+    omni_kwargs = vars(args).copy()
+    # Override CLI --model with the derived model_name.
+    omni_kwargs["model"] = model_name
+    omni = Omni(**omni_kwargs)
 
     thinker_sampling_params = SamplingParams(
         temperature=0.9,
@@ -326,7 +329,6 @@ def main(args):
         seed=SEED,
         detokenize=True,
         repetition_penalty=1.1,
-        stop_token_ids=[0],
     )
 
     all_sampling_params = [
@@ -390,6 +392,13 @@ def main(args):
             output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
 
             # Convert to numpy array and ensure correct format
+            # In async_chunk mode, audio may arrive as a list of chunks
+            if isinstance(audio_tensor, list):
+                import torch
+
+                audio_tensor = torch.cat(
+                    [(t if isinstance(t, torch.Tensor) else torch.tensor(t)).flatten() for t in audio_tensor]
+                )
             audio_numpy = audio_tensor.float().detach().cpu().numpy()
 
             # Ensure audio is 1D (flatten if needed)
@@ -457,12 +466,6 @@ def parse_args():
         type=int,
         default=65536,
         help="Threshold for using shared memory in bytes (default: 65536)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=None,
-        help="Output directory for generated audio files.",
     )
     parser.add_argument(
         "--output-wav",

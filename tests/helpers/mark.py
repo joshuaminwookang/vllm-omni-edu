@@ -2,10 +2,33 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pytest marks and decorators for hardware / resource selection (CUDA, ROCm, …)."""
 
+import os
+
 import pytest
-from vllm.utils.torch_utils import cuda_device_count_stateless
+from vllm.platforms import current_platform
 
 # Re-exported from tests.helpers.env (GPU wait + DeviceMemoryMonitor).
+
+
+def _visible_device_count(env_var: str) -> int | None:
+    visible_devices = os.environ.get(env_var)
+    if visible_devices is None:
+        return None
+    devices = [token.strip() for token in visible_devices.split(",") if token.strip()]
+    if devices == ["-1"]:
+        return 0
+    return len(devices)
+
+
+def _effective_device_count(env_var: str) -> int:
+    try:
+        platform_count = current_platform.device_count()
+    except Exception:
+        platform_count = 0
+    visible_count = _visible_device_count(env_var)
+    if visible_count is None:
+        return platform_count
+    return min(platform_count, visible_count)
 
 
 def cuda_marks(*, res: str, num_cards: int):
@@ -20,11 +43,17 @@ def cuda_marks(*, res: str, num_cards: int):
     if num_cards == 1:
         return marks
     test_distributed = pytest.mark.distributed_cuda(num_cards=num_cards)
-    test_skipif = pytest.mark.skipif_cuda(
-        cuda_device_count_stateless() < num_cards,
+
+    skip_condition = not current_platform.is_cuda() or (_effective_device_count("CUDA_VISIBLE_DEVICES") < num_cards)
+    test_skipif_cuda = pytest.mark.skipif_cuda(
+        skip_condition,
         reason=f"Need at least {num_cards} CUDA GPUs to run the test.",
     )
-    return marks + [test_distributed, test_skipif]
+    test_skipif = pytest.mark.skipif(
+        skip_condition,
+        reason=f"Need at least {num_cards} CUDA GPUs to run the test.",
+    )
+    return marks + [test_distributed, test_skipif_cuda, test_skipif]
 
 
 def rocm_marks(*, res: str, num_cards: int):
@@ -49,8 +78,18 @@ def xpu_marks(*, res: str, num_cards: int):
     marks = [test_resource, test_platform_detail]
     if num_cards == 1:
         return marks
-    test_distributed = pytest.mark.distributed_rocm(num_cards=num_cards)
-    return marks + [test_distributed]
+    test_distributed = pytest.mark.distributed_xpu(num_cards=num_cards)
+
+    skip_condition = not current_platform.is_xpu() or (current_platform.device_count() < num_cards)
+    test_skipif_xpu = pytest.mark.skipif_xpu(
+        skip_condition,
+        reason=f"Need at least {num_cards} XPUs to run the test.",
+    )
+    test_skipif = pytest.mark.skipif(
+        skip_condition,
+        reason=f"Need at least {num_cards} XPUs to run the test.",
+    )
+    return marks + [test_distributed, test_skipif_xpu, test_skipif]
 
 
 def musa_marks(*, res: str, num_cards: int):

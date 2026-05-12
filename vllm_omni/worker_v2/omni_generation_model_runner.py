@@ -8,6 +8,7 @@ buffer and lifecycle hooks.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -17,15 +18,18 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu.model_runner import (
     BatchDescriptor,
-    ExecuteModelState,
     IntermediateTensors,
     get_uniform_token_count,
 )
 
-from vllm_omni.core.sched.output import OmniCachedRequestData
+from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+from vllm_omni.worker_v2.forward_compat import add_forward_compat_kwargs
+from vllm_omni.worker_v2.omni_model_runner import (
+    OmniGPUModelRunner,
+    _make_execute_model_state,
+)
 
 logger = init_logger(__name__)
 
@@ -66,11 +70,9 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         - No KV cache / rope state to reinitialize
         - staged writes are applied once at the end
 
-        ``additional_information`` is NOT merged here — the inherited
-        ``OmniGPUModelRunner.update_requests`` (called right after this
-        method in ``execute_model``) is the single source of truth for
-        ``intermediate_buffer`` updates.  Doing it in both places would
-        clone every tensor to CPU twice per step.
+        The old intermediate buffer for this slot is cleared here; the
+        inherited ``OmniGPUModelRunner.update_requests`` (called right after
+        this method in ``execute_model``) writes the current chunk state.
         """
         cached = scheduler_output.scheduled_cached_reqs
         if not cached.req_ids:
@@ -84,15 +86,34 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             return
 
         updated = False
+        released_chunks: list[OmniNewRequestData] = []
 
-        for req_id in cached.req_ids:
+        for i, req_id in enumerate(cached.req_ids):
             new_ids = new_prompt_ids.get(req_id)
             if new_ids is None:
                 continue
 
             req_idx = self.req_states.req_id_to_index.get(req_id)
             if req_idx is None:
+                block_ids = cached.new_block_ids[i]
+                released_chunks.append(
+                    OmniNewRequestData(
+                        req_id=req_id,
+                        prompt_token_ids=new_ids,
+                        mm_features=[],
+                        sampling_params=None,
+                        pooling_params=None,
+                        block_ids=block_ids if block_ids is not None else tuple(),
+                        num_computed_tokens=0,
+                        lora_request=None,
+                        prompt_embeds=None,
+                        prefill_token_ids=new_ids,
+                        additional_information=cached.additional_information.get(req_id),
+                    )
+                )
                 continue
+
+            self.model_state.intermediate_buffer.remove_request(req_idx)
 
             # In-place update token state — same slot, no remove/re-add.
             # .np[] = direct write (no GPU buffer); stage_write = GPU-synced.
@@ -106,8 +127,23 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
             updated = True
 
+        if released_chunks:
+            self.add_requests(SimpleNamespace(scheduled_new_reqs=released_chunks))
         if updated:
             self.req_states.apply_staged_writes()
+
+    def _release_generation_slots(self, input_batch: Any) -> None:
+        if not getattr(self.model_config, "async_chunk", False):
+            return
+        model_state = getattr(self, "model_state", None)
+        remove_request = getattr(self, "_remove_request", None)
+        if model_state is None or remove_request is None:
+            return
+        for i in range(input_batch.num_reqs):
+            req_id = input_batch.req_ids[i]
+            req_idx = int(input_batch.idx_mapping_np[i])
+            model_state.remove_request(req_idx)
+            remove_request(req_id)
 
     # ------------------------------------------------------------------
     # profile / warmup — skip sampler since there are no logits
@@ -136,6 +172,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
+        is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             self.finish_requests(scheduler_output)
@@ -154,7 +191,12 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
-        batch_desc = self.cudagraph_manager.dispatch(num_reqs, num_toks, uniform_tok_count)
+        batch_desc, _ = self._dispatch_batch_descriptor(
+            num_reqs=num_reqs,
+            num_toks=num_toks,
+            uniform_tok_count=uniform_tok_count,
+            use_eager=is_profile,
+        )
 
         if batch_desc.num_tokens == 0:
             return self.kv_connector.no_forward(scheduler_output)
@@ -188,6 +230,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             "intermediate_tensors": intermediate_tensors,
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        add_forward_compat_kwargs(model_inputs, input_batch, self.sampler)
 
         batch_descriptor = BatchDescriptor(
             num_tokens=input_batch.num_tokens_after_padding,
@@ -221,7 +264,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                     exc_info=True,
                 )
                 self._gen_model_output = None
-                self.execute_model_state = ExecuteModelState(
+                self.execute_model_state = _make_execute_model_state(
                     input_batch=input_batch,
                     attn_metadata=None,
                     slot_mappings_by_layer=None,
@@ -239,7 +282,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         # ExecuteModelState is required by the upstream engine loop
         # (EngineCore checks execute_model_state is not None before
         # calling sample_tokens).
-        self.execute_model_state = ExecuteModelState(
+        self.execute_model_state = _make_execute_model_state(
             input_batch=input_batch,
             attn_metadata=None,
             slot_mappings_by_layer=None,
@@ -292,6 +335,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         # stays RUNNING until the orchestrator marks it done via
         # chunk_transfer_adapter.finished_requests.
         sampled_token_ids: list[list[int]] = [[] for _ in range(len(req_ids))]
+        self._release_generation_slots(input_batch)
 
         # model_output is guaranteed to be OmniOutput here — the
         # make_omni_output failure path sets _gen_model_output = None

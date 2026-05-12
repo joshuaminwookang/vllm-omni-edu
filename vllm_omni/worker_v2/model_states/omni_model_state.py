@@ -11,6 +11,8 @@ Extends ``DefaultModelState`` with:
 
 from __future__ import annotations
 
+import threading
+import types
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -34,6 +36,44 @@ from vllm_omni.worker_v2.model_states.intermediate_buffer import (
 from vllm_omni.worker_v2.model_states.plugin import OmniModelStatePlugin
 
 logger = init_logger(__name__)
+_rope_patch_lock = threading.Lock()
+
+
+def _default_mrope_positions(
+    self_model: Any,
+    input_tokens: list[int],
+    mm_features: list,
+) -> tuple[torch.Tensor, int]:
+    """Return 3D sequential positions with zero delta.
+
+    For non-vision Omni models (e.g. TTS Talker), all 3 M-RoPE
+    dimensions use the same sequential positions. Delta=0 keeps decode
+    positions sequential, identical to the 1D case but broadcast to 3 dims.
+    """
+    n = len(input_tokens)
+    pos = torch.arange(n, dtype=torch.long)
+    return pos.unsqueeze(0).expand(3, -1), 0
+
+
+def _make_safe_get_rope(orig_get_rope):
+    from vllm.v1.worker.gpu.mm.rope import RopeState
+
+    def _safe_get_rope(model_config: Any, mdl: Any, **kwargs: Any) -> Any:
+        try:
+            result = orig_get_rope(model_config, mdl, **kwargs)
+        except (AssertionError, TypeError):
+            result = None
+
+        needs_mrope = bool(getattr(model_config, "uses_mrope", False))
+        if result is not None and (not needs_mrope or getattr(result, "num_dims", 0) >= 3):
+            return result
+        if not needs_mrope:
+            return None
+        if not hasattr(mdl, "get_mrope_input_positions"):
+            mdl.get_mrope_input_positions = types.MethodType(_default_mrope_positions, mdl)
+        return RopeState(num_dims=3, has_delta=True, **kwargs)
+
+    return _safe_get_rope
 
 
 class OmniModelState(DefaultModelState):
@@ -73,81 +113,15 @@ class OmniModelState(DefaultModelState):
         # The patch is applied via a class-level lock to prevent
         # concurrent OmniModelState instances (e.g. different stages
         # in a thread pool) from overwriting each other's patch.
-        import threading
-        import types
-
-        from vllm.v1.worker.gpu.mm.rope import RopeState
         from vllm.v1.worker.gpu.model_states import default as _default_mod
 
-        if not hasattr(OmniModelState, "_rope_patch_lock"):
-            OmniModelState._rope_patch_lock = threading.Lock()
-
-        def _safe_get_rope(model_config: Any, mdl: Any, **kwargs: Any) -> Any:
-            result = None
-            needs_mrope_override = False
-            try:
-                result = _orig_get_rope(model_config, mdl, **kwargs)
-            except (AssertionError, TypeError):
-                # Model does not implement SupportsMRoPE — may still
-                # need M-RoPE if config declares mrope_section.
-                needs_mrope_override = model_config.uses_mrope
-
-            if result is not None and not needs_mrope_override:
-                # Upstream returned a rope but check dimensionality:
-                # config has mrope_section but upstream returned a 1D
-                # rope (e.g. rope_type="default" with mrope_section).
-                if model_config.uses_mrope and getattr(result, "num_dims", 0) < 3:
-                    logger.info(
-                        "Upstream returned %dD rope but config has mrope_section; "
-                        "overriding with RopeState(num_dims=3).",
-                        getattr(result, "num_dims", 0),
-                    )
-                    needs_mrope_override = True
-                else:
-                    return result
-
-            if not needs_mrope_override:
-                return None
-
-            logger.info(
-                "Model uses M-RoPE (config) but does not implement SupportsMRoPE; creating RopeState(num_dims=3)."
-            )
-            # Add get_mrope_input_positions if missing.
-            # Returns 3D sequential positions with delta=0
-            # (pure text, no vision token offsets).
-            if not hasattr(mdl, "get_mrope_input_positions"):
-
-                def _default_mrope_positions(
-                    self_model: Any,
-                    input_tokens: list[int],
-                    mm_features: list,
-                ) -> tuple[torch.Tensor, int]:
-                    """Return 3D sequential positions with zero delta.
-
-                    For non-vision Omni models (e.g. TTS Talker),
-                    all 3 M-RoPE dimensions use the same sequential
-                    positions.  Delta=0 means decode-step positions
-                    are simply ``num_computed + offset``, identical
-                    to the 1D case but broadcast to 3 dims.
-                    """
-                    n = len(input_tokens)
-                    pos = torch.arange(n, dtype=torch.long)
-                    return pos.unsqueeze(0).expand(3, -1), 0
-
-                mdl.get_mrope_input_positions = types.MethodType(_default_mrope_positions, mdl)
-            # has_delta=True is required so init_prefill_positions
-            # calls get_mrope_input_positions (not the XD-RoPE
-            # path).  delta=0 (returned above) means no offset is
-            # applied during decode — positions stay sequential.
-            return RopeState(num_dims=3, has_delta=True, **kwargs)
-
-        with OmniModelState._rope_patch_lock:
-            _orig_get_rope = _default_mod.get_rope_state
-            _default_mod.get_rope_state = _safe_get_rope
+        with _rope_patch_lock:
+            orig_get_rope = _default_mod.get_rope_state
+            _default_mod.get_rope_state = _make_safe_get_rope(orig_get_rope)
             try:
                 super().__init__(vllm_config, model, encoder_cache, device)
             finally:
-                _default_mod.get_rope_state = _orig_get_rope
+                _default_mod.get_rope_state = orig_get_rope
         max_num_reqs = self.scheduler_config.max_num_seqs
         self.intermediate_buffer = OmniIntermediateBuffer(max_num_reqs)
         self.has_preprocess: bool = getattr(model, "has_preprocess", False)
@@ -361,7 +335,8 @@ class OmniModelState(DefaultModelState):
             emb_slice = embeds[start : start + n_tok]
 
             try:
-                new_ids, new_emb, updates = self.model.preprocess(ids_slice, emb_slice, **buf)
+                info = {key: value for key, value in buf.items() if isinstance(key, str)}
+                new_ids, new_emb, updates = self.model.preprocess(ids_slice, emb_slice, **info)
             except Exception:
                 logger.warning(
                     "preprocess failed for req_idx=%d (req_id=%s); skipping preprocess for this request",
@@ -439,11 +414,19 @@ class OmniModelState(DefaultModelState):
                 batch_step,
             )
 
-        audio_key = getattr(self.model, "talker_mtp_output_key", "audio_codes")
+        audio_key = getattr(self.model, "talker_mtp_output_key", ("codes", "audio"))
         for j, (i, start, _) in enumerate(mtp_batches):
             embeds[start : start + 1] = new_emb[j : j + 1]
             req_idx = int(input_batch.idx_mapping_np[i])
-            self.intermediate_buffer.update(req_idx, {audio_key: codes[j : j + 1]}, gpu_keys)
+            if isinstance(audio_key, tuple) and len(audio_key) == 2:
+                updates = {audio_key[0]: {audio_key[1]: codes[j : j + 1]}}
+            elif isinstance(audio_key, str):
+                updates = {audio_key: codes[j : j + 1]}
+            else:
+                raise TypeError(
+                    f"talker_mtp_output_key must be a string or 2-tuple, got {type(audio_key).__name__}: {audio_key!r}"
+                )
+            self.intermediate_buffer.update(req_idx, updates, gpu_keys)
 
     # ------------------------------------------------------------------
     # Post-forward: per-request postprocess
@@ -473,7 +456,8 @@ class OmniModelState(DefaultModelState):
             start = int(input_batch.query_start_loc_np[i])
             n_tok = int(input_batch.num_scheduled_tokens[i])
             h_slice = hidden_states[start : start + n_tok]
-            updates = self.model.postprocess(h_slice, **buf)
+            info = {key: value for key, value in buf.items() if isinstance(key, str) and key != "hidden_states"}
+            updates = self.model.postprocess(h_slice, **info)
             if updates:
                 self.intermediate_buffer.update(req_idx, updates, gpu_keys)
 

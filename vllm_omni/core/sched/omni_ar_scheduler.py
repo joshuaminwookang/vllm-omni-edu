@@ -10,6 +10,7 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
@@ -19,6 +20,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.compat import make_filtered_call
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -31,6 +33,32 @@ from vllm_omni.worker_v2.model_states.intermediate_buffer import (
 logger = init_logger(__name__)
 
 VLLM_OMNI_USE_V2_RUNNER = bool(int(os.environ.get("VLLM_OMNI_USE_V2_RUNNER", "0")))
+
+_KNOWN_ENGINE_CORE_OUTPUT_COMPAT_FIELDS = {
+    "num_cached_tokens",
+    "num_external_computed_tokens",
+    "is_segment_finished",
+    "new_prompt_len_snapshot",
+}
+
+
+def _make_engine_core_output(**kwargs):
+    output, unknown = make_filtered_call(
+        EngineCoreOutput,
+        known_extra_fields=_KNOWN_ENGINE_CORE_OUTPUT_COMPAT_FIELDS,
+        **kwargs,
+    )
+    if unknown:
+        logger.warning("Unknown fields passed to EngineCoreOutput: %s", sorted(unknown))
+    return output
+
+
+def _get_request_num_cached_tokens(request) -> int:
+    return max(getattr(request, "num_cached_tokens", 0), 0)
+
+
+def _get_request_num_external_computed_tokens(request) -> int:
+    return max(getattr(request, "num_external_computed_tokens", 0), 0)
 
 
 @dataclass
@@ -45,12 +73,9 @@ class KVCacheTransferData:
 
 
 class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
-    """
-    OmniARScheduler: Scheduler for vLLM-Omni multimodal processing.
-
-    This scheduler extends vLLM's scheduler to support multimodal and
-    non-autoregressive processing with additional fields and methods
-    specific to vLLM-Omni.
+    """Synchronous AutoRegressive scheduler for vLLM-Omni. This class is also
+    used as a base class for the OmniARAsyncScheduler and holds most of the
+    core scheduling logic.
     """
 
     def __init__(self, *args, **kwargs):
@@ -87,6 +112,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+
+    def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
+        """num_computed_tokens minus async placeholders (KV actually on GPU)."""
+        # Output placeholders are zero when async scheduling isn't used
+        return request.num_computed_tokens - request.num_output_placeholders
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
@@ -154,10 +184,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 return True
             return False
 
+        # seq_len for KV transfer must exclude async placeholders.
+        confirmed_computed = self._get_confirmed_num_computed_tokens(request)
+
         if criteria_type == "prefill_finished":
-            if request.num_computed_tokens >= request.num_prompt_tokens:
+            if confirmed_computed >= request.num_prompt_tokens:
                 self.transfer_triggered_requests.add(request.request_id)
-                self._mark_request_for_kv_transfer(request.request_id, request.num_computed_tokens)
+                self._mark_request_for_kv_transfer(request.request_id, confirmed_computed)
                 actually_queued = request.request_id in self.requests_needing_kv_transfer
 
                 if stop_decode_on_trigger and actually_queued:
@@ -177,9 +210,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 try:
                     idx = new_token_ids.index(target_token_id)
                     tokens_to_exclude = len(new_token_ids) - (idx + 1)
-                    snapshot_len = request.num_computed_tokens - tokens_to_exclude
+                    snapshot_len = confirmed_computed - tokens_to_exclude
                 except ValueError:
-                    snapshot_len = request.num_computed_tokens
+                    snapshot_len = confirmed_computed
 
                 self._mark_request_for_kv_transfer(request.request_id, snapshot_len)
                 actually_queued = request.request_id in self.requests_needing_kv_transfer
@@ -350,6 +383,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request_id=req_id,
                 )
 
+            # Free encoder inputs only after the step has actually executed.
+            if request.has_encoder_inputs:
+                self._free_encoder_inputs(request)
+
             stopped = False
             is_segment_finished = False
             new_logprobs = None
@@ -373,6 +410,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # transfer (e.g. prefill finished / special token) but continues decoding.
             if not stopped and self._process_kv_transfer_trigger(request, new_token_ids):
                 stopped = True
+
+            if new_token_ids and self.structured_output_manager.should_advance(request):
+                struct_output_request = request.structured_output_request
+                assert struct_output_request is not None
+                assert struct_output_request.grammar is not None
+                if not struct_output_request.grammar.accept_tokens(req_id, new_token_ids):
+                    logger.error(
+                        "Unexpected: grammar rejected tokens %s for request %s. Terminating request.",
+                        new_token_ids,
+                        req_id,
+                    )
+                    request.status = RequestStatus.FINISHED_ERROR
+                    request.resumable = False
+                    stopped = True
 
             if stopped:
                 routed_experts = self._get_routed_experts(request)
@@ -398,18 +449,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request.sampling_params is not None and request.sampling_params.logprobs is not None and logprobs:
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
-            if new_token_ids and self.structured_output_manager.should_advance(request):
-                struct_output_request = request.structured_output_request
-                assert struct_output_request is not None
-                assert struct_output_request.grammar is not None
-                ok = struct_output_request.grammar.accept_tokens(req_id, new_token_ids)
-                if not ok:
-                    logger.warning(
-                        "Unexpected: grammar rejected tokens %s for request %s.",
-                        new_token_ids,
-                        req_id,
-                    )
-
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
@@ -418,7 +457,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
-                    EngineCoreOutput(
+                    _make_engine_core_output(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
                         finish_reason=finish_reason,
@@ -427,10 +466,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
+                        prefill_stats=request.take_prefill_stats(),
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
-                        num_cached_tokens=request.num_cached_tokens,
-                        num_external_computed_tokens=request.num_external_computed_tokens,
+                        num_cached_tokens=_get_request_num_cached_tokens(request),
+                        num_external_computed_tokens=_get_request_num_external_computed_tokens(request),
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         is_segment_finished=is_segment_finished,
@@ -457,13 +497,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
                 outputs[request.client_index].append(
-                    EngineCoreOutput(
+                    _make_engine_core_output(
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
-                        num_cached_tokens=request.num_cached_tokens,
+                        num_cached_tokens=_get_request_num_cached_tokens(request),
                     )
                 )
                 if self.chunk_transfer_adapter is not None:
@@ -631,7 +671,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     )
             else:
                 self.waiting_for_transfer_free.add(request_id)
-                self._mark_request_for_kv_transfer(request_id, request.num_computed_tokens)
+                confirmed_computed = self._get_confirmed_num_computed_tokens(request)
+                self._mark_request_for_kv_transfer(request_id, confirmed_computed)
                 # Return KV transfer metadata so it propagates to RequestOutput
                 if request_id in self.requests_needing_kv_transfer:
                     transfer_data = self.requests_needing_kv_transfer[request_id]
@@ -766,3 +807,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         self.requests_needing_kv_transfer.clear()
         return requests
+
+
+class OmniARAsyncScheduler(OmniARScheduler, AsyncVLLMScheduler):
+    """Asynchronous AutoRegressive scheduler."""

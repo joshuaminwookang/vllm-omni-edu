@@ -1,18 +1,8 @@
-"""OmniGPUModelRunner — thin inheritance layer over v2 GPUModelRunner.
-
-Injects ``OmniModelState`` via ``load_model`` and adds:
-
-* ``execute_model`` override with pre-forward (preprocess + MTP) and
-  post-forward (postprocess) hooks, plus generic tuple-return interception
-  support (not used by current Omni models)
-* ``finish_requests`` hook to clean up the intermediate buffer
-* ``capture_model`` override to conditionally exclude FULL CUDA graph mode
-  (only when the model forward returns a tuple that requires Python-level
-  interception)
-"""
+"""Omni v2 GPU model runner hooks."""
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import torch
@@ -30,7 +20,9 @@ from vllm.v1.worker.gpu.model_runner import (
     get_uniform_token_count,
 )
 
+from vllm_omni.compat import make_filtered_namedtuple
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.worker_v2.forward_compat import add_forward_compat_kwargs
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     _resolve_additional_information,
@@ -39,39 +31,54 @@ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 logger = init_logger(__name__)
 
+_model_state_patch_lock = threading.RLock()
+_GPU_MODEL_RUNNER_HAS_SHUTDOWN = hasattr(GPUModelRunner, "shutdown")
+_KNOWN_EXECUTE_MODEL_STATE_COMPAT_FIELDS = {"num_tokens_across_dp"}
+
+
+def _make_execute_model_state(**kwargs):
+    state, unknown = make_filtered_namedtuple(
+        ExecuteModelState,
+        known_extra_fields=_KNOWN_EXECUTE_MODEL_STATE_COMPAT_FIELDS,
+        **kwargs,
+    )
+    if unknown:
+        logger.warning("Unknown fields passed to ExecuteModelState: %s", sorted(unknown))
+    return state
+
+
+def _needs_capture_tensor_unwrap(model: Any) -> bool:
+    return bool(getattr(model, "_returns_tuple", False) or getattr(model, "model_stage", None) == "thinker")
+
 
 class OmniGPUModelRunner(GPUModelRunner):
     """Thin layer over v2 ``GPUModelRunner`` for Omni lifecycle hooks."""
 
     model_state: OmniModelState
     _last_aux_output: Any
-    # Whether the model.forward returns (hidden_states, aux_dict) tuple.
-    # If False, FULL CUDA graph mode is allowed since no Python-level
-    # tuple interception is needed.
-    # NOTE: No current Omni model sets _returns_tuple (thinker uses
-    # _last_captured_layers instead).  Kept for future model support.
+    _last_multimodal_outputs: dict[str, Any] | None
     _model_returns_tuple: bool
+
+    def shutdown(self) -> None:
+        if _GPU_MODEL_RUNNER_HAS_SHUTDOWN:
+            super().shutdown()
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         import vllm.v1.worker.gpu.model_runner as _mr_module
 
-        _orig = _mr_module.init_model_state
-        _mr_module.init_model_state = init_omni_model_state
-        try:
-            super().load_model(*args, **kwargs)
-        finally:
-            _mr_module.init_model_state = _orig
+        with _model_state_patch_lock:
+            _orig = _mr_module.init_model_state
+            _mr_module.init_model_state = init_omni_model_state
+            try:
+                super().load_model(*args, **kwargs)
+            finally:
+                _mr_module.init_model_state = _orig
         self._last_aux_output = None
-        # Detect whether model.forward returns a tuple.
-        self._model_returns_tuple = getattr(self.model, "_returns_tuple", False)
-        # Exclude FULL graph when any per-step Python-level post-forward
-        # logic must run (tuple intercept, _last_captured_layers, etc.).
-        # FULL graph replay bypasses Python entirely — only PIECEWISE
-        # is safe for these models.
+        self._last_multimodal_outputs = None
+        self._model_returns_tuple = _needs_capture_tensor_unwrap(self.model)
         self._exclude_full_graph = self._model_returns_tuple or hasattr(self.model, "_last_captured_layers")
 
-        # Preprocess models get embeddings via run_preprocess(), not
-        # encoder_runner (whose buffer size would mismatch).
+        # Preprocess models own embedding buffers; encoder_runner sizing would mismatch.
         if getattr(self.model, "has_preprocess", False) and self.supports_mm_inputs:
             self.supports_mm_inputs = False
             self.encoder_cache = None
@@ -107,6 +114,8 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             def _capture_forward(*args: Any, **kwargs: Any) -> torch.Tensor:
                 output = original_forward(*args, **kwargs)
+                if isinstance(output, OmniOutput):
+                    return output.text_hidden_states
                 if isinstance(output, tuple):
                     return output[0]
                 return output
@@ -118,9 +127,35 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.model.forward = original_forward  # type: ignore[assignment]
         return super().capture_model()
 
-    # ------------------------------------------------------------------
-    # execute_model: preprocess → forward → postprocess + tuple intercept
-    # ------------------------------------------------------------------
+    def _dispatch_batch_descriptor(
+        self,
+        *,
+        num_reqs: int,
+        num_toks: int,
+        uniform_tok_count: int,
+        use_eager: bool,
+    ):
+        if use_eager:
+            batch_desc = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_toks,
+                num_reqs=num_reqs,
+            )
+        else:
+            batch_desc = self.cudagraph_manager.dispatch(num_reqs, num_toks, uniform_tok_count)
+        if self.dp_size > 1:
+            from vllm.v1.worker.gpu.dp_utils import sync_cudagraph_and_dp_padding
+
+            return sync_cudagraph_and_dp_padding(
+                self.cudagraph_manager,
+                batch_desc,
+                num_toks,
+                num_reqs,
+                uniform_tok_count,
+                self.dp_size,
+                self.dp_rank,
+            )
+        return batch_desc, None
 
     @torch.inference_mode()
     def execute_model(
@@ -129,6 +164,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
+        is_profile: bool = False,
     ) -> Any:
         if not dummy_run:
             self.finish_requests(scheduler_output)
@@ -139,48 +175,27 @@ class OmniGPUModelRunner(GPUModelRunner):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 return self.kv_connector.no_forward(scheduler_output)
 
-        # --- Batch descriptor + dispatch ---
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
-        batch_desc = self.cudagraph_manager.dispatch(num_reqs, num_toks, uniform_tok_count)
-
         # Encoder-decoder models: disable compilation when encoder inputs
         # are scheduled (dynamic cross-attention cache updates).
-        skip_compiled = False
-        if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
-            skip_compiled = True
-            batch_desc = BatchExecutionDescriptor(
-                cg_mode=CUDAGraphMode.NONE,
-                num_tokens=num_toks,
-                num_reqs=num_reqs,
-            )
-
-        # DP sync: align batch sizes across data-parallel ranks.
-        num_tokens_across_dp = None
-        if self.dp_size > 1:
-            from vllm.v1.worker.gpu.dp_utils import sync_cudagraph_and_dp_padding
-
-            batch_desc, num_tokens_across_dp = sync_cudagraph_and_dp_padding(
-                self.cudagraph_manager,
-                batch_desc,
-                num_toks,
-                num_reqs,
-                uniform_tok_count,
-                self.dp_size,
-                self.dp_rank,
-            )
+        skip_compiled = self.is_encoder_decoder and bool(scheduler_output.scheduled_encoder_inputs)
+        batch_desc, num_tokens_across_dp = self._dispatch_batch_descriptor(
+            num_reqs=num_reqs,
+            num_toks=num_toks,
+            uniform_tok_count=uniform_tok_count,
+            use_eager=is_profile or skip_compiled,
+        )
 
         if batch_desc.num_tokens == 0:
             return self.kv_connector.no_forward(scheduler_output)
 
-        # --- Prepare inputs ---
         if not dummy_run:
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
 
-            # LoRA activation
             if self.lora_config:
                 lora_inputs = self.lora_state.make_lora_inputs(
                     input_batch.req_ids,
@@ -202,7 +217,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 block_tables = None
                 slot_mappings = None
 
-        # --- Attention metadata ---
         attn_metadata = None
         slot_mappings_by_layer = None
         if not (dummy_run and skip_attn_for_dummy_run):
@@ -218,7 +232,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.kv_cache_config,
             )
 
-        # --- MM embeddings ---
         inputs_embeds = None
         if self.supports_mm_inputs and self.is_first_pp_rank:
             inputs_embeds = self.model_state.get_mm_embeddings(
@@ -227,7 +240,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.req_states,
             )
 
-        # --- Build model_inputs ---
         model_inputs: dict[str, Any] = {
             "input_ids": input_batch.input_ids,
             "positions": input_batch.positions,
@@ -235,6 +247,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             "intermediate_tensors": intermediate_tensors,
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        add_forward_compat_kwargs(model_inputs, input_batch, self.sampler)
         if not self.is_first_pp_rank:
             model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
@@ -253,10 +266,12 @@ class OmniGPUModelRunner(GPUModelRunner):
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # FULL graph replay.  Preprocess already wrote to the static
             # inputs_embeds buffer above.
+            assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
             hidden_states = model_output
             self._last_aux_output = None
+            self._last_multimodal_outputs = None
         else:
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
@@ -277,8 +292,11 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             # Extract hidden_states from model output.
             self._last_aux_output = None
+            self._last_multimodal_outputs = None
             if isinstance(model_output, OmniOutput):
                 hidden_states = model_output.text_hidden_states
+                if model_output.multimodal_outputs:
+                    self._last_multimodal_outputs = model_output.multimodal_outputs
             elif isinstance(model_output, tuple) and len(model_output) == 2:
                 hidden_states, self._last_aux_output = model_output
                 if hasattr(self.model, "_last_captured_layers"):
@@ -286,12 +304,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             else:
                 hidden_states = model_output
 
-        # ★ POST-FORWARD: per-request postprocess
         if not dummy_run and isinstance(hidden_states, torch.Tensor):
             self.model_state.run_postprocess(hidden_states, input_batch)
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
-        self.execute_model_state = ExecuteModelState(
+        self.execute_model_state = _make_execute_model_state(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
             slot_mappings_by_layer=slot_mappings_by_layer,

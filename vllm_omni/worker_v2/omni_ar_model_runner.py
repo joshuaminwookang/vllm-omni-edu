@@ -18,9 +18,11 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
+from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
@@ -50,6 +52,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         intermediate_tensors: Any | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
+        is_profile: bool = False,
     ) -> Any:
         if not dummy_run:
             self._handle_kv_transfer_pre(scheduler_output)
@@ -58,6 +61,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             intermediate_tensors,
             dummy_run=dummy_run,
             skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+            is_profile=is_profile,
         )
 
     # ------------------------------------------------------------------
@@ -91,15 +95,23 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # --- Omni: reconstruct raw model output and post-process ---
         aux = self._last_aux_output
         self._last_aux_output = None
-        raw_output: Any = hidden_states
-        if aux is not None:
-            raw_output = (hidden_states, aux)
+        multimodal_outputs = self._last_multimodal_outputs
+        self._last_multimodal_outputs = None
+        raw_output = self._reconstruct_raw_model_output(
+            hidden_states=hidden_states,
+            multimodal_outputs=multimodal_outputs,
+            aux=aux,
+        )
         text_hidden, multimodal_outputs = self.model_state.postprocess_model_output(
             raw_output, input_batch, self.req_states
         )
 
         # --- Standard v2 sampling ---
-        sampler_output, num_sampled, num_rejected = self.sample(text_hidden, input_batch, grammar_output)
+        sampler_output, num_sampled, num_rejected = self._sample_with_prompt_token_compat(
+            text_hidden,
+            input_batch,
+            grammar_output,
+        )
 
         if self.use_pp:
             from vllm.v1.worker.gpu.pp_utils import pp_broadcast
@@ -140,7 +152,6 @@ class OmniARModelRunner(OmniGPUModelRunner):
             num_sampled_tokens=num_sampled,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
-            copy_event=self.output_copy_event,
             text_hidden=text_hidden if need_pooler else None,
             multimodal_outputs=multimodal_outputs if need_pooler else None,
             input_batch=input_batch if need_pooler else None,
@@ -164,6 +175,22 @@ class OmniARModelRunner(OmniGPUModelRunner):
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _reconstruct_raw_model_output(
+        *,
+        hidden_states: torch.Tensor,
+        multimodal_outputs: dict[str, Any] | None,
+        aux: Any | None,
+    ) -> Any:
+        if multimodal_outputs:
+            return OmniOutput(
+                text_hidden_states=hidden_states,
+                multimodal_outputs=multimodal_outputs,
+            )
+        if aux is not None:
+            return (hidden_states, aux)
+        return hidden_states
+
+    @staticmethod
     def _build_pooler_output_from_cpu(
         hidden_cpu: torch.Tensor,
         mm_cpu: dict[str, Any],
@@ -179,19 +206,90 @@ class OmniARModelRunner(OmniGPUModelRunner):
             end = start + int(num_scheduled_tokens[i])
             payload: dict[str, Any] = {"hidden": hidden_cpu[start:end]}
             for k, v in mm_cpu.items():
-                if isinstance(v, torch.Tensor) and v.shape[0] == total:
-                    payload[k] = v[start:end].contiguous()
-                elif isinstance(v, dict):
-                    payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
-                elif isinstance(v, list):
-                    elem = v[i] if i < len(v) else v[0]
-                    if isinstance(elem, torch.Tensor):
-                        elem = elem.clone()
-                    payload[k] = elem
-                else:
-                    payload[k] = v
-            pooler.append(payload)
+                payload[k] = _slice_pooler_value(
+                    v,
+                    req_index=i,
+                    start=start,
+                    end=end,
+                    total_tokens=total,
+                )
+            pooler.append(flatten_payload(payload))
         return pooler
+
+    def _sample_with_prompt_token_compat(
+        self,
+        text_hidden: torch.Tensor,
+        input_batch: Any,
+        grammar_output: GrammarOutput | None,
+    ) -> tuple[Any, Any, Any]:
+        """Run upstream sampling while restoring V1 prompt-id compatibility.
+
+        Some Omni AR stages sample from a logits vocabulary smaller than the
+        tokenizer/input vocabulary.  V1 corrected ``prompt_token_ids`` after it
+        had the real logits tensor.  MR V2's upstream ``sample`` owns logits
+        computation, so wrap ``compute_logits`` for this call and clamp from the
+        actual logits shape instead of guessing from config.
+        """
+        compute_logits = getattr(self.model, "compute_logits", None)
+        if not callable(compute_logits):
+            return self.sample(text_hidden, input_batch, grammar_output)
+
+        def compute_logits_with_prompt_token_compat(*args: Any, **kwargs: Any) -> Any:
+            logits = compute_logits(*args, **kwargs)
+            logits_shape = getattr(logits, "shape", ()) if logits is not None else ()
+            logits_vocab_size = logits_shape[-1] if logits_shape else None
+            if isinstance(logits_vocab_size, int):
+                self._clamp_sampling_prompt_token_ids(input_batch, logits_vocab_size)
+            return logits
+
+        model_dict = getattr(self.model, "__dict__", {})
+        had_instance_compute_logits = isinstance(model_dict, dict) and "compute_logits" in model_dict
+        original_instance_compute_logits = model_dict.get("compute_logits") if had_instance_compute_logits else None
+        setattr(self.model, "compute_logits", compute_logits_with_prompt_token_compat)
+        try:
+            return self.sample(text_hidden, input_batch, grammar_output)
+        finally:
+            if had_instance_compute_logits:
+                setattr(self.model, "compute_logits", original_instance_compute_logits)
+            else:
+                try:
+                    delattr(self.model, "compute_logits")
+                except AttributeError:
+                    setattr(self.model, "compute_logits", compute_logits)
+
+    @staticmethod
+    def _clamp_sampling_prompt_token_ids(
+        input_batch: Any,
+        logits_vocab_size: int | None,
+    ) -> None:
+        """Clamp sampler prompt IDs to the stage logits vocabulary.
+
+        V1 Omni AR runner did this after computing logits.  MR V2 samples via
+        the upstream helper, so normalize the metadata before that call.
+        """
+        if logits_vocab_size is None or logits_vocab_size <= 0:
+            return
+        if getattr(input_batch, "vocab_size", logits_vocab_size) <= logits_vocab_size:
+            return
+
+        sampling_metadata = getattr(input_batch, "sampling_metadata", None)
+        if sampling_metadata is None or getattr(sampling_metadata, "no_penalties", False):
+            return
+
+        prompt_token_ids = getattr(sampling_metadata, "prompt_token_ids", None)
+        if prompt_token_ids is None:
+            return
+
+        max_token_id = logits_vocab_size - 1
+        if isinstance(prompt_token_ids, torch.Tensor):
+            prompt_token_ids.clamp_(max=max_token_id)
+            return
+
+        if isinstance(prompt_token_ids, list):
+            sampling_metadata.prompt_token_ids = [
+                [min(int(tok), max_token_id) for tok in ids] if isinstance(ids, list) else min(int(ids), max_token_id)
+                for ids in prompt_token_ids
+            ]
 
     # ------------------------------------------------------------------
     # KV transfer
@@ -243,6 +341,16 @@ def _async_copy_tensor(x: torch.Tensor) -> torch.Tensor:
     return x.to("cpu", non_blocking=True)
 
 
+def _async_copy_mm_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _async_copy_tensor(value)
+    if isinstance(value, dict):
+        return {key: _async_copy_mm_value(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_async_copy_mm_value(val) for val in value]
+    return value
+
+
 def _async_copy_mm(mm_outputs: dict | None, total_tokens: int) -> dict[str, Any]:
     """Non-blocking D2H copy of multimodal output tensors."""
     if not mm_outputs:
@@ -250,20 +358,47 @@ def _async_copy_mm(mm_outputs: dict | None, total_tokens: int) -> dict[str, Any]
     cpu: dict[str, Any] = {}
     for k, v in mm_outputs.items():
         try:
-            if isinstance(v, torch.Tensor) and v.shape[0] == total_tokens:
-                cpu[k] = _async_copy_tensor(v)
-            elif isinstance(v, dict):
-                sub: dict[str, torch.Tensor] = {}
-                for sk, sv in v.items():
-                    if isinstance(sv, torch.Tensor) and sv.shape[0] == total_tokens:
-                        sub[str(sk)] = _async_copy_tensor(sv)
-                if sub:
-                    cpu[k] = sub
-            elif isinstance(v, list) and v:
-                cpu[k] = [(_async_copy_tensor(el) if isinstance(el, torch.Tensor) else el) for el in v]
+            cpu[k] = _async_copy_mm_value(v)
         except Exception:
             logger.exception("Error async-copying multimodal output %s", k)
     return cpu
+
+
+def _slice_pooler_value(
+    value: Any,
+    *,
+    req_index: int,
+    start: int,
+    end: int,
+    total_tokens: int,
+) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.dim() > 0 and value.shape[0] == total_tokens:
+            return value[start:end].contiguous()
+        return value.clone()
+    if isinstance(value, dict):
+        return {
+            key: _slice_pooler_value(
+                val,
+                req_index=req_index,
+                start=start,
+                end=end,
+                total_tokens=total_tokens,
+            )
+            for key, val in value.items()
+        }
+    if isinstance(value, list):
+        if not value:
+            return []
+        elem = value[req_index] if req_index < len(value) else value[0]
+        return _slice_pooler_value(
+            elem,
+            req_index=req_index,
+            start=start,
+            end=end,
+            total_tokens=total_tokens,
+        )
+    return value
 
 
 class OmniAsyncOutput(AsyncModelRunnerOutput):
@@ -281,7 +416,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         num_sampled_tokens: torch.Tensor,
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
-        copy_event: torch.cuda.Event,
+        copy_event: torch.cuda.Event | None = None,
         text_hidden: torch.Tensor | None = None,
         multimodal_outputs: dict | None = None,
         input_batch: Any | None = None,
@@ -289,7 +424,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
-        self.copy_event = copy_event
+        self.copy_event = copy_event if copy_event is not None else torch.cuda.Event()
 
         # Snapshot input_batch metadata needed for pooler_output slicing
         self._need_pooler = text_hidden is not None
