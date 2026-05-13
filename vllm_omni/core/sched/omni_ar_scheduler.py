@@ -214,6 +214,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     req_id=nr.req_id,
                     external_req_id=(getattr(request, "external_req_id", None) if request else None),
                     prompt_token_ids=nr.prompt_token_ids,
+                    prefill_token_ids=getattr(nr, "prefill_token_ids", None),
                     mm_features=nr.mm_features,
                     sampling_params=nr.sampling_params,
                     pooling_params=nr.pooling_params,
