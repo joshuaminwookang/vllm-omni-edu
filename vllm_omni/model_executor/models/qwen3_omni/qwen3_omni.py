@@ -321,11 +321,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 msg = "Qwen3 Omni thinker get_mrope_input_positions requires mm_features"
                 raise ValueError(msg)
             return self.thinker.get_mrope_input_positions(input_tokens, mm_features)
-        if (
-            hf_config is not None
-            and image_grid_thw is not None
-            and video_grid_thw is not None
-        ):
+        if hf_config is not None and image_grid_thw is not None and video_grid_thw is not None:
             return MRotaryEmbedding.get_input_positions_tensor(
                 input_tokens,
                 hf_config=hf_config,
