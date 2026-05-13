@@ -20,7 +20,7 @@ from tests.helpers.mark import hardware_test
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.example]
 
-END2END = str(EXAMPLES / "offline_inference" / "qwen3_tts" / "end2end.py")
+END2END = str(EXAMPLES / "offline_inference" / "text_to_speech" / "qwen3_tts" / "end2end.py")
 
 CUSTOM_VOICE_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 VOICE_DESIGN_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
