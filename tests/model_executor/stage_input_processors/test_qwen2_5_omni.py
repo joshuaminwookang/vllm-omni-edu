@@ -12,7 +12,13 @@ from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import (
     talker2code2wav,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.skip(reason="qwen2_5_omni stage input processor tests need alignment with model changes that are not yet implemented")]
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.cpu,
+    pytest.mark.skip(
+        reason="qwen2_5_omni stage input processor tests need alignment with model changes that are not yet implemented"
+    ),
+]
 
 
 def _source_outputs(output):

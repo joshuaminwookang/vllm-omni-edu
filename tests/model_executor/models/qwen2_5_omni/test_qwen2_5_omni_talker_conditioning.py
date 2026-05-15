@@ -11,7 +11,13 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni import (
     Qwen2_5OmniForConditionalGeneration,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.skip(reason="Methods _build_thinker_to_talker_latent and _build_talker_decode_reply_cache not yet implemented in Qwen2_5OmniForConditionalGeneration")]
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.cpu,
+    pytest.mark.skip(
+        reason="Methods _build_thinker_to_talker_latent and _build_talker_decode_reply_cache not yet implemented in Qwen2_5OmniForConditionalGeneration"
+    ),
+]
 
 
 def test_build_thinker_to_talker_latent_adds_token_embeddings():
