@@ -40,7 +40,7 @@ Committers have write access and merge rights. They typically have deep expertis
 - [@lishunyang12](https://github.com/lishunyang12): Quantization and Configuration
 - [@princepride](https://github.com/princepride): Diffusion and Omni Support
 - [@RuixiangMa](https://github.com/RuixiangMa): Diffusion models, parallel, cache, and docs
-- [@SamitHuang](https://github.com/SamitHuang): RL and Diffusion
+- [@SamitHuang](https://github.com/SamitHuang): RL, Diffusion, and cache
 - [@tzhouam](https://github.com/tzhouam): Engine and New Model Support
 - [@wtomin](https://github.com/wtomin): Diffusion models, parallel, and docs
 - [@ZeldaHuang](https://github.com/ZeldaHuang): Omni Support
@@ -59,7 +59,7 @@ This section breaks down diffusion-related responsibilities. If you have PRs tou
 
 - Parallel: @RuixiangMa, @wtomin
 - Attention backend: @ZJY0516
-- Cache: @yuanheng-zhao, @RuixiangMa, @samixxx
+- Cache: @yuanheng-zhao, @RuixiangMa, @SamitHuang
 - Offload: @yuanheng-zhao
 - Quantization: @lishunyang12, @david6666666
 - Kernel fusion / communication-computation: @ZJY0516
