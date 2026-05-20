@@ -59,7 +59,7 @@ This section breaks down diffusion-related responsibilities. If you have PRs tou
 
 - Parallel: @RuixiangMa, @wtomin
 - Attention backend: @ZJY0516
-- Cache: @yuanheng-zhao, @RuixiangMa, yongxiang
+- Cache: @yuanheng-zhao, @RuixiangMa, @samixxx
 - Offload: @yuanheng-zhao
 - Quantization: @lishunyang12, @david6666666
 - Kernel fusion / communication-computation: @ZJY0516
