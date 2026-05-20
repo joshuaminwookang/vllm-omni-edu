@@ -4,6 +4,7 @@ import time
 from collections import defaultdict
 from typing import Any
 
+import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
@@ -20,6 +21,7 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
 )
 from vllm.v1.metrics.perf import PerfStats
+from vllm.v1.outputs import RoutedExpertsLists
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -33,6 +35,20 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
+
+
+def _omni_routed_experts_for_request(routed_experts: RoutedExpertsLists, request) -> np.ndarray | None:
+    """Extract per-request routed experts from RoutedExpertsLists using slot_mapping."""
+    if routed_experts is None:
+        return None
+    slots = getattr(request, "block_table", None)
+    if slots is None:
+        return None
+    slot_set = set(slots)
+    mask = np.isin(routed_experts.slot_mapping, list(slot_set))
+    data = routed_experts.routing_data[mask]
+    return data if data.size > 0 else None
+
 
 logger = init_logger(__name__)
 
@@ -500,11 +516,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 stopped = True
 
             if stopped:
-                if (
-                    model_runner_output.routed_experts_dict is not None
-                    and req_id in model_runner_output.routed_experts_dict
-                ):
-                    routed_experts = model_runner_output.routed_experts_dict[req_id]
+                if model_runner_output.routed_experts is not None:
+                    routed_experts = _omni_routed_experts_for_request(model_runner_output.routed_experts, request)
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:

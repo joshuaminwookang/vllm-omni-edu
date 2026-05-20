@@ -661,6 +661,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
         kv_connector_output=None,
         cudagraph_stats=None,
         req_id_to_index={"req-s1": 0},
+        routed_experts=None,
         routed_experts_dict=None,
     )
 
@@ -747,6 +748,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
         cudagraph_stats=None,
         req_id_to_index={"req-ar": 0},
         kv_extracted_req_ids=None,
+        routed_experts=None,
         routed_experts_dict=None,
     )
 

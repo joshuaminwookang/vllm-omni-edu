@@ -36,6 +36,7 @@ from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.outputs import RoutedExpertsLists
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
     xgr_torch_compile = LazyLoader(
@@ -56,6 +57,52 @@ class OmniGPUModelRunner(GPUModelRunner):
         # The Omni tensor prefix cache will be allocated
         # when we initialize the metadata builders if enabled
         self.omni_prefix_cache = None
+
+    def _omni_routed_experts_d2h(self, scheduler_output) -> None:
+        """Issue routed-experts D2H copy matching upstream GPUModelRunner pattern.
+
+        Upstream does this inline in ``execute_model``:
+            buf = self.routed_experts_capturer.get_device_buffer()
+            total = scheduler_output.total_num_scheduled_tokens
+            self.routed_experts_cpu[:total].copy_(buf[:total], non_blocking=True)
+            self.routed_experts_slot_mapping_cpu[:total].copy_(
+                self.routed_experts_slot_mapping_device[:total], non_blocking=True)
+        """
+        if not self.routed_experts_initialized:
+            return
+        buf = self.routed_experts_capturer.get_device_buffer()
+        total = scheduler_output.total_num_scheduled_tokens
+        self.routed_experts_cpu[:total].copy_(buf[:total], non_blocking=True)
+        if hasattr(self, "routed_experts_slot_mapping_device"):
+            self.routed_experts_slot_mapping_cpu[:total].copy_(
+                self.routed_experts_slot_mapping_device[:total],
+                non_blocking=True,
+            )
+
+    def _omni_extract_routed_experts(self, scheduler_output) -> "RoutedExpertsLists | None":
+        """Extract routed experts matching upstream GPUModelRunner pattern.
+
+        Upstream (sync path, sample_tokens):
+            total = scheduler_output.total_num_scheduled_tokens
+            output.routed_experts = RoutedExpertsLists(
+                routing_data=self.routed_experts_cpu[:total].numpy(),
+                slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
+            )
+
+        Returns RoutedExpertsLists (batch-level, with slot_mapping) so that
+        downstream schedulers can use slot_mapping to map back to requests.
+        """
+        from vllm.v1.outputs import RoutedExpertsLists
+
+        if not self.routed_experts_initialized:
+            return None
+        total = scheduler_output.total_num_scheduled_tokens
+        if total <= 0:
+            return None
+        return RoutedExpertsLists(
+            routing_data=self.routed_experts_cpu[:total].numpy(),
+            slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
+        )
 
     def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
         """Override to fix scheduler_metadata buffer size for FA3 + CUDA graph.

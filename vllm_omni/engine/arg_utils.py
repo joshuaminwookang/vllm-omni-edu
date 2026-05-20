@@ -459,6 +459,8 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "stage_id",  # orch: route (headless); engine: identity
         "log_stats",  # both want the flag
         "stage_configs_path",  # orch: load legacy YAML; engine: may reference for validation
+        "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
+        "tokenizer",  # orch: detect model type; engine: tokenization
     }
 )
 
