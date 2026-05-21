@@ -86,26 +86,23 @@ class Qwen2_5OmniForConditionalGeneration(
                 architectures=["Qwen2_5OmniThinkerModel"],
             )
             self.model = self.thinker
-            self._mark_language_model(self.thinker)  # required by upstream SupportsMoE
             self.talker = None
             self.token2wav = None
 
         elif self.model_stage == "talker":
             multimodal_config.skip_mm_profiling = True
-            # register the process function for the talker stage
             self.has_preprocess = True
             self.set_custom_preprocess(self.talker_preprocess)
             self.thinker = None
             # Initialize talker model wrapper (handles projection + LM)
-            self.talker = init_vllm_registered_model(
-                vllm_config=vllm_config,
-                prefix=maybe_prefix(prefix, "talker"),
-                hf_config=talker_config,
-                # Use registry architecture key
-                architectures=["Qwen2_5OmniTalkerModel"],
-            )
+            with self._mark_language_model(vllm_config=vllm_config):
+                self.talker = init_vllm_registered_model(
+                    vllm_config=vllm_config,
+                    prefix=maybe_prefix(prefix, "talker"),
+                    hf_config=talker_config,
+                    architectures=["Qwen2_5OmniTalkerModel"],
+                )
             self.model = self.talker
-            self._mark_language_model(self.talker)  # required by upstream SupportsMoE
             self.token2wav = None
             # set suppress start id according to token2wav
             t2w_token_end_id = getattr(
@@ -132,17 +129,17 @@ class Qwen2_5OmniForConditionalGeneration(
             self.token2wav_config = getattr(config, "token2wav_config", None)
             self.token2wav = None
             if self.token2wav_config is not None:
-                self.token2wav = init_vllm_registered_model(
-                    vllm_config=vllm_config,
-                    prefix=maybe_prefix(prefix, "token2wav"),
-                    hf_config=self.token2wav_config,
-                    architectures=["Qwen2_5OmniToken2WavModel"],
-                )
+                with self._mark_language_model(vllm_config=vllm_config):
+                    self.token2wav = init_vllm_registered_model(
+                        vllm_config=vllm_config,
+                        prefix=maybe_prefix(prefix, "token2wav"),
+                        hf_config=self.token2wav_config,
+                        architectures=["Qwen2_5OmniToken2WavModel"],
+                    )
             # voice resources (loaded on demand)
             self._token2wav_conds: dict[str, torch.Tensor] = {}
             self._token2wav_ref_mels: dict[str, torch.Tensor] = {}
             self.model = self.token2wav
-            self._mark_language_model(self.model)  # required by upstream SupportsMoE
             self.requires_raw_input_tokens = True
         else:
             raise ValueError("Invalid model stage")
