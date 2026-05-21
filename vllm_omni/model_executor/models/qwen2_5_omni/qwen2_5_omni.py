@@ -149,6 +149,18 @@ class Qwen2_5OmniForConditionalGeneration(
             (self.thinker.make_empty_intermediate_tensors) if self.model_stage == "thinker" else lambda: None
         )
 
+    def get_language_model(self) -> nn.Module:
+        """Return the language model for MoE detection in upstream load_model.
+
+        Upstream GPUModelRunner.load_model() calls get_language_model() to find
+        the MoE model inside VLM wrappers. For thinker (which IS MoE), delegate
+        to the child. For talker/code2wav (not MoE, not SupportsMultiModal),
+        return self.model directly to avoid NotImplementedError.
+        """
+        if hasattr(self.model, "get_language_model"):
+            return self.model.get_language_model()
+        return self.model
+
     # -------------------- Device utilities --------------------
     @staticmethod
     def _module_device(module: nn.Module) -> torch.device:
