@@ -687,7 +687,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
+                sample_hidden_states = hidden_states[logits_indices.to(hidden_states.device)]
                 # Try with sampling_metadata first; fall back to without for models that don't support it
                 try:
                     logits = self.model.compute_logits(
@@ -699,7 +699,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # Rare case.
                 assert not self.is_pooling_model
 
-                sample_hidden_states = hidden_states[logits_indices]
+                sample_hidden_states = hidden_states[logits_indices.to(hidden_states.device)]
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(self.vllm_config, num_tokens_padded)

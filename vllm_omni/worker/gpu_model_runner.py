@@ -794,6 +794,15 @@ class OmniGPUModelRunner(GPUModelRunner):
             raise ValueError(f"Invalid hidden states type: {type(hidden_states)}")
         return text_hidden_states, multimodal_outputs
 
+    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
+        # Models loaded with load_format=dummy (e.g. MossTTSNano) may
+        # produce CPU hidden_states while the upstream sampler warmup
+        # expects GPU tensors.  Skip the warmup in that case — a
+        # meaningful warmup requires real weights anyway.
+        if hidden_states.device != self.device:
+            return
+        super()._dummy_sampler_run(hidden_states=hidden_states)
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -1147,7 +1156,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        logit_indices_device = torch.from_numpy(logit_indices).to(self.device, non_blocking=True)
+        logit_indices_device = torch.from_numpy(logit_indices).to(
+            hidden_states.device, non_blocking=True
+        )
         return hidden_states, hidden_states[logit_indices_device]
 
     # ------------------------------------------------------------------
