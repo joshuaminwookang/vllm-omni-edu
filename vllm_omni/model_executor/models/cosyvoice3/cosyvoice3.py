@@ -365,6 +365,13 @@ class CosyVoice3Model(
         else:
             raise ValueError(f"Model stage not supported {self.model_stage}")
 
+
+    def get_language_model(self) -> "nn.Module":
+        """Return the language model for upstream MoE detection."""
+        if hasattr(self.model, "get_language_model"):
+            return self.model.get_language_model()
+        return self.model
+
     def _create_llm_vllm_config(self, parent_config: VllmConfig) -> VllmConfig:
         """Create VllmConfig for the inner Qwen2 LLM.
 
