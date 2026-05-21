@@ -1156,9 +1156,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        logit_indices_device = torch.from_numpy(logit_indices).to(
-            hidden_states.device, non_blocking=True
-        )
+        logit_indices_device = torch.from_numpy(logit_indices).to(hidden_states.device, non_blocking=True)
         return hidden_states, hidden_states[logit_indices_device]
 
     # ------------------------------------------------------------------

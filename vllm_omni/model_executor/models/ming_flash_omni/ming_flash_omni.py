@@ -143,7 +143,6 @@ class MingFlashOmniForConditionalGeneration(
                 f"For image generation use stage_type: diffusion with model_arch: MingImagePipeline."
             )
 
-
     def get_language_model(self) -> "nn.Module":
         """Return the language model for upstream MoE detection."""
         if hasattr(self.model, "get_language_model"):

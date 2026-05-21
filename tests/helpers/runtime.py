@@ -306,19 +306,43 @@ class OmniServer:
         raise RuntimeError(f"Server failed to start within {max_wait} seconds")
 
     def _kill_process_tree(self, pid):
+        """Kill the process tree rooted at *pid*.
+
+        Terminate the parent **first** so the OmniServer can gracefully shut
+        down its stage-engine children through the orchestrator.  This avoids
+        the ``subprocess died unexpectedly`` ERROR that the APIServer monitor
+        thread logs when children are killed before the parent, which in turn
+        can cause CI watchdogs to false-trigger on the upstream ``Shutdown
+        initiated`` message.
+        """
         try:
             parent = psutil.Process(pid)
             children = parent.children(recursive=True)
-            all_pids = [pid] + [child.pid for child in children]
 
+            # 1. Terminate the parent first — let it run its graceful
+            #    shutdown cascade (orchestrator → stage pools → engine cores).
+            try:
+                parent.terminate()
+            except psutil.NoSuchProcess:
+                pass
+
+            # 2. Give the parent time to shut down its children cleanly.
+            try:
+                parent.wait(timeout=15)
+            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                pass
+
+            # 3. Clean up any children that are still alive.
             for child in children:
                 try:
-                    child.terminate()
+                    if child.is_running():
+                        child.terminate()
                 except psutil.NoSuchProcess:
                     pass
 
-            _, still_alive = psutil.wait_procs(children, timeout=10)
+            gone, still_alive = psutil.wait_procs(children, timeout=5)
 
+            # 4. Force-kill stubborn survivors.
             for child in still_alive:
                 try:
                     child.kill()
@@ -326,19 +350,26 @@ class OmniServer:
                     pass
 
             try:
-                parent.terminate()
-                parent.wait(timeout=10)
-            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
-                try:
+                if parent.is_running():
                     parent.kill()
+                    parent.wait(timeout=5)
+            except psutil.NoSuchProcess:
+                pass
+
+            # 5. Final sweep — `kill -9` anything that escaped.
+            time.sleep(1)
+            alive_processes: list[int] = []
+            for child in children:
+                try:
+                    if child.is_running():
+                        alive_processes.append(child.pid)
                 except psutil.NoSuchProcess:
                     pass
-
-            time.sleep(1)
-            alive_processes = []
-            for check_pid in all_pids:
-                if psutil.pid_exists(check_pid):
-                    alive_processes.append(check_pid)
+            try:
+                if parent.is_running():
+                    alive_processes.append(parent.pid)
+            except psutil.NoSuchProcess:
+                pass
 
             if alive_processes:
                 print(f"Warning: Processes still alive: {alive_processes}")

@@ -243,7 +243,6 @@ class CovoAudioForConditionalGeneration(
             else lambda *args, **kwargs: None
         )
 
-
     def get_language_model(self) -> "nn.Module":
         """Return the language model for upstream MoE detection."""
         if hasattr(self.model, "get_language_model"):
