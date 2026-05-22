@@ -340,7 +340,7 @@ class OmniServer:
                 except psutil.NoSuchProcess:
                     pass
 
-            gone, still_alive = psutil.wait_procs(children, timeout=5)
+            gone, still_alive = psutil.wait_procs(children, timeout=10)
 
             # 4. Force-kill stubborn survivors.
             for child in still_alive:
@@ -352,7 +352,7 @@ class OmniServer:
             try:
                 if parent.is_running():
                     parent.kill()
-                    parent.wait(timeout=5)
+                    parent.wait(timeout=10)
             except psutil.NoSuchProcess:
                 pass
 
