@@ -144,7 +144,8 @@ class OmniEngineArgs(EngineArgs):
     force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
     task_type: str | None = None
-    worker_cls: str = None
+    worker_cls: str = None  # type: ignore[assignment]  # Upstream default is "auto"; omni resolves
+    # in __post_init__ based on worker_type (ar/generation), so None is safe here.
     enable_sleep_mode: bool = False
     omni: bool = False
 
