@@ -314,6 +314,10 @@ class OmniServer:
         thread logs when children are killed before the parent, which in turn
         can cause CI watchdogs to false-trigger on the upstream ``Shutdown
         initiated`` message.
+
+        When the parent does not exit within the grace period (e.g. CPU-
+        offloaded workers stuck in CUDA D-state), the method falls back to
+        killing children first so the parent can be reaped cleanly.
         """
         try:
             parent = psutil.Process(pid)
@@ -327,36 +331,55 @@ class OmniServer:
                 pass
 
             # 2. Give the parent time to shut down its children cleanly.
+            parent_exited = False
             try:
                 parent.wait(timeout=15)
-            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
-                pass
-
-            # 3. Clean up any children that are still alive.
-            for child in children:
-                try:
-                    if child.is_running():
-                        child.terminate()
-                except psutil.NoSuchProcess:
-                    pass
-
-            gone, still_alive = psutil.wait_procs(children, timeout=10)
-
-            # 4. Force-kill stubborn survivors.
-            for child in still_alive:
-                try:
-                    child.kill()
-                except psutil.NoSuchProcess:
-                    pass
-
-            try:
-                if parent.is_running():
-                    parent.kill()
-                    parent.wait(timeout=10)
+                parent_exited = True
             except psutil.NoSuchProcess:
+                parent_exited = True
+            except psutil.TimeoutExpired:
                 pass
 
-            # 5. Final sweep — `kill -9` anything that escaped.
+            if not parent_exited:
+                # Parent is stuck — children (e.g. CPU-offloaded CFG workers)
+                # are likely in uninterruptible sleep.  Kill children first
+                # so the parent can be reaped without lingering as a zombie.
+                for child in children:
+                    try:
+                        child.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                psutil.wait_procs(children, timeout=5)
+                try:
+                    parent.kill()
+                    parent.wait(timeout=5)
+                except psutil.NoSuchProcess:
+                    pass
+            else:
+                # Parent exited cleanly — clean up any remaining children.
+                for child in children:
+                    try:
+                        if child.is_running():
+                            child.terminate()
+                    except psutil.NoSuchProcess:
+                        pass
+
+                gone, still_alive = psutil.wait_procs(children, timeout=10)
+
+                for child in still_alive:
+                    try:
+                        child.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+
+                try:
+                    if parent.is_running():
+                        parent.kill()
+                        parent.wait(timeout=10)
+                except psutil.NoSuchProcess:
+                    pass
+
+            # 3. Final sweep — `kill -9` anything that escaped.
             time.sleep(1)
             alive_processes: list[int] = []
             for child in children:
