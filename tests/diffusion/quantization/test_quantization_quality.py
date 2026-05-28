@@ -71,7 +71,7 @@ class QualityTestConfig:
     prompt: str  # generation prompt
     max_lpips: float  # fail threshold — higher = more lenient
     model: str | None = None  # HF model name
-    quantization: str | None = None  # quantization method, e.g. "fp8"
+    quantization: str | dict[str, object] | None = None  # quantization method/config, e.g. "fp8"
     baseline_model: str | None = None  # explicit BF16/local baseline path
     quantized_model: str | None = None  # explicit quantized/local model path
     height: int = 1024
@@ -118,7 +118,7 @@ QUALITY_CONFIGS = [
     QualityTestConfig(
         id="fp8_z_image",
         model="Tongyi-MAI/Z-Image-Turbo",
-        quantization="fp8",
+        quantization={"method": "fp8", "ignored_layers": ["img_mlp"]},
         task="t2i",
         prompt=(
             "A breathtaking twilight scene atop a floating archipelago of crystalline islands suspended in an "

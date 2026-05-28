@@ -10,6 +10,12 @@ VLLM_OMNI_QUALITY_OUTPUT_DIR=$PWD/tests/diffusion/quantization/artifacts/fp8_z_i
   -s -v -m ""
 ```
 
+Quantized config:
+
+```python
+{"method": "fp8", "ignored_layers": ["img_mlp"]}
+```
+
 Result: failed with the current `max_lpips=0.15` threshold.
 
 | Metric | Value |
