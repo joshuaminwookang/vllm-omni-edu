@@ -358,6 +358,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        if self.routed_experts_initialized:
+            self.routed_experts_capturer.clear_buffer()
+
         if not getattr(self, "_warmup_state_cleared", False):
             self._warmup_state_cleared = True
             if hasattr(self.model, "_clear_warmup_state"):

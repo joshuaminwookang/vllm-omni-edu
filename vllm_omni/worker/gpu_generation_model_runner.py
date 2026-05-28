@@ -107,6 +107,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        if self.routed_experts_initialized:
+            self.routed_experts_capturer.clear_buffer()
+
         if hasattr(self, "_omni_connector"):
             for request in getattr(scheduler_output, "pending_input_registrations", []):
                 self.register_chunk_recv(request)
