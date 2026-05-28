@@ -14,27 +14,26 @@ Quantized config:
 
 ```python
 {
-    "transformer": {
-        "method": "fp8",
-        "ignored_layers": [
-            "img_mlp",
-            "layers.15..29.{attention.to_qkv,attention.to_out.0,feed_forward.w13,feed_forward.w2}",
-        ],
-    },
-    "default": None,
+    "method": "fp8",
+    "ignored_layers": [
+        "img_mlp",
+        "layers.15..29.{attention.to_qkv,attention.to_out.0,feed_forward.w13,feed_forward.w2}",
+        "model.layers.28..35.{self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj,"
+        "mlp.gate_proj,mlp.up_proj,mlp.down_proj}",
+    ],
 }
 ```
 
-Result: passed with `max_lpips=0.10`.
+Result: passed with `max_lpips=0.15`.
 
 | Metric | Value |
 |--------|-------|
-| LPIPS | 0.096935 |
-| PSNR | 21.893253 dB |
-| MAE | 0.037334 |
+| LPIPS | 0.128773 |
+| PSNR | 20.125577 dB |
+| MAE | 0.047712 |
 
-Timing from the scan run for this config: BF16 `2.297244s`, FP8 `2.062006s`
-(`0.8976x` of BF16 generation time).
+This uses regular online FP8 quantization for the text encoder, with only the final
+8 text-encoder blocks routed through `ignored_layers` for BF16 fallback.
 
 ## Comparison
 

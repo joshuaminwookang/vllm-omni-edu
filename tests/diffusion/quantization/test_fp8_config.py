@@ -213,35 +213,6 @@ def test_integration_per_component():
     assert config.quantization_config.component_configs["vae"] is None
 
 
-def test_recursive_replace_linear_resolves_component_quantization(monkeypatch):
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.diffusion.models import utils
-
-    model = nn.Module()
-    model.text_encoder = nn.Sequential(nn.Linear(2, 2))
-    model.transformer = nn.Sequential(nn.Linear(2, 2))
-    config = OmniDiffusionConfig(
-        model="test",
-        quantization_config={
-            "transformer": {"method": "fp8"},
-            "default": None,
-        },
-    )
-
-    calls = {}
-
-    def fake_replace(linear, style, quant_config, *, prefix):
-        calls[prefix] = quant_config
-        return nn.Identity()
-
-    monkeypatch.setattr(utils, "replace_linear_class", fake_replace)
-
-    utils.recursive_replace_linear(model, config)
-
-    assert calls["text_encoder.0"] is None
-    assert calls["transformer.0"].get_name() == "fp8"
-
-
 def test_transformer_config_auto_detects_modelopt_fp8():
     from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
 

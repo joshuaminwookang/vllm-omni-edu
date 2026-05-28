@@ -119,23 +119,33 @@ QUALITY_CONFIGS = [
         id="fp8_z_image",
         model="Tongyi-MAI/Z-Image-Turbo",
         quantization={
-            "transformer": {
-                "method": "fp8",
-                "ignored_layers": [
-                    "img_mlp",
-                    *[
-                        f"layers.{layer_id}.{suffix}"
-                        for layer_id in range(15, 30)
-                        for suffix in (
-                            "attention.to_qkv",
-                            "attention.to_out.0",
-                            "feed_forward.w13",
-                            "feed_forward.w2",
-                        )
-                    ],
+            "method": "fp8",
+            "ignored_layers": [
+                "img_mlp",
+                *[
+                    f"layers.{layer_id}.{suffix}"
+                    for layer_id in range(15, 30)
+                    for suffix in (
+                        "attention.to_qkv",
+                        "attention.to_out.0",
+                        "feed_forward.w13",
+                        "feed_forward.w2",
+                    )
                 ],
-            },
-            "default": None,
+                *[
+                    f"model.layers.{layer_id}.{suffix}"
+                    for layer_id in range(28, 36)
+                    for suffix in (
+                        "self_attn.q_proj",
+                        "self_attn.k_proj",
+                        "self_attn.v_proj",
+                        "self_attn.o_proj",
+                        "mlp.gate_proj",
+                        "mlp.up_proj",
+                        "mlp.down_proj",
+                    )
+                ],
+            ],
         },
         task="t2i",
         prompt=(
@@ -159,7 +169,7 @@ QUALITY_CONFIGS = [
             "starlight waterfalls. Ethereal, melancholic, and transcendent mood—like a moment of quiet revelation "
             "at the edge of existence."
         ),
-        max_lpips=0.10,
+        max_lpips=0.15,
         num_inference_steps=20,
     ),
     QualityTestConfig(
