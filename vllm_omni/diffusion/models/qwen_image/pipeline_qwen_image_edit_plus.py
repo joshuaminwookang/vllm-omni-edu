@@ -238,9 +238,7 @@ class QwenImageEditPlusPipeline(
         self.transformer = QwenImageTransformer2DModel(od_config=od_config, **transformer_kwargs)
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.processor = retry_on_missing_shard(
-            lambda: Qwen2VLProcessor.from_pretrained(
-                model, subfolder="processor", local_files_only=local_files_only
-            )
+            lambda: Qwen2VLProcessor.from_pretrained(model, subfolder="processor", local_files_only=local_files_only)
         )
 
         self.stage = None

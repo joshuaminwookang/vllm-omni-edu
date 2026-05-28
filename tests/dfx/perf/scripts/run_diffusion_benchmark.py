@@ -241,9 +241,7 @@ def _wait_for_port(host: str, port: int, timeout: int = 1200, proc: subprocess.P
         if proc is not None:
             ret = proc.poll()
             if ret is not None:
-                raise RuntimeError(
-                    f"Server process exited with code {ret} before port {host}:{port} became ready"
-                )
+                raise RuntimeError(f"Server process exited with code {ret} before port {host}:{port} became ready")
         time.sleep(2)
     raise RuntimeError(f"Server did not start on {host}:{port} within {timeout}s")
 

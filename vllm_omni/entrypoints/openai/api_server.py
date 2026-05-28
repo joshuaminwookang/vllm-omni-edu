@@ -1562,6 +1562,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 prompt=request.prompt,
                 extra_body=extra_body,
                 request_id=f"img_gen-{random_uuid()}",
+                raw_request=raw_request,
             )
             if isinstance(generation_result, ErrorResponse):
                 return JSONResponse(
@@ -1968,6 +1969,7 @@ async def edit_images(
                 output_format=output_format,
                 output_compression=output_compression,
                 size=size_str,
+                raw_request=raw_request,
             )
             if stream and not isinstance(generation_result, ErrorResponse):
                 return StreamingResponse(

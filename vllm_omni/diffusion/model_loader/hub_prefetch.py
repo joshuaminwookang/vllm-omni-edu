@@ -395,8 +395,7 @@ def retry_on_missing_shard(load_fn, *, max_retries: int = 3, base_delay: float =
                 raise
             delay = base_delay * (attempt + 1)
             logger.warning(
-                "from_pretrained failed with shard-resolution race (%s); "
-                "retrying in %.1fs (attempt %d/%d)",
+                "from_pretrained failed with shard-resolution race (%s); retrying in %.1fs (attempt %d/%d)",
                 exc,
                 delay,
                 attempt + 1,

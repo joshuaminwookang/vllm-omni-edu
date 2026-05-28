@@ -239,9 +239,7 @@ class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParalle
         )
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.processor = retry_on_missing_shard(
-            lambda: Qwen2VLProcessor.from_pretrained(
-                model, subfolder="processor", local_files_only=local_files_only
-            )
+            lambda: Qwen2VLProcessor.from_pretrained(model, subfolder="processor", local_files_only=local_files_only)
         )
 
         # modules re-implemented for vLLM-Omni
