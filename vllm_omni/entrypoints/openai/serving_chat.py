@@ -2660,7 +2660,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         stage_durations = result.stage_durations
         peak_memory_mb = result.peak_memory_mb
         cot_output = None
-=======
 
         req_out = getattr(result, "request_output", None)
         if req_out:
@@ -2671,7 +2670,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     ar_text = extra.get("ar_generated_text")
                     if isinstance(ar_text, str) and ar_text.strip():
                         cot_output = ar_text
->>>>>>> d59cd067 ([Bugfix] Align Offline and Online Inference (#3506))
 
         req_out = getattr(result, "request_output", None)
         if req_out:
@@ -2777,7 +2775,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 flat_images.extend(item)
             else:
                 flat_images.append(item)
-<<<<<<< HEAD
         return flat_images
 
     async def _create_diffusion_chat_completion(
