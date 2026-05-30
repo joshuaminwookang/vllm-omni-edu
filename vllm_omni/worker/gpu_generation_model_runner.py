@@ -526,9 +526,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         )
 
     @torch.inference_mode()
-    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
+    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logger.warning("Dummy sampler run is not implemented for generation model")
-        return None
+        return torch.tensor([])
 
     @torch.inference_mode()
     def _dummy_run(
