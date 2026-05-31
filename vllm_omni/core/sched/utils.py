@@ -6,9 +6,7 @@ import numpy as np
 from vllm.v1.outputs import RoutedExpertsLists
 
 
-def omni_routed_experts_for_request(
-    routed_experts: RoutedExpertsLists, request
-) -> np.ndarray | None:
+def omni_routed_experts_for_request(routed_experts: RoutedExpertsLists, request) -> np.ndarray | None:
     """Extract per-request routed experts from RoutedExpertsLists using slot_mapping.
 
     Matches upstream RoutedExpertsManager.get() pattern — filters routing_data
