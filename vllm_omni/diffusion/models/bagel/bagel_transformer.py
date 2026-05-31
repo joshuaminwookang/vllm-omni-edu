@@ -582,8 +582,12 @@ class PackedAttentionMoT(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        # Pre-merge code cast to float32 before q_norm/k_norm — bf16
+        # RMSNorm accumulation drift compounds across segmented prefill
+        # (x2t builds the cache via 3+ sequential forward_cache_update_*
+        # calls), producing degenerate token repetition in generate_text.
+        q = self.q_norm(q.to(torch.float32))
+        k = self.k_norm(k.to(torch.float32))
 
         cos, sin = [x[..., : self.head_dim // 2] for x in packed_query_position_embeddings]
         q = self.rotary_op(q.to(cos.dtype).unsqueeze(0), cos, sin).squeeze(0)
@@ -598,16 +602,52 @@ class PackedAttentionMoT(nn.Module):
             cache_v = past_key_values.value_cache[self.layer_idx]
             full_k = torch.cat([cache_k, k], dim=0)
             full_v = torch.cat([cache_v, v], dim=0)
+            cache_len = cache_k.shape[0]
         else:
             full_k = k
             full_v = v
+            cache_len = 0
 
-        attn = self.attn_causal if is_causal else self.attn_noncausal
-        attn_out = attn(
-            q.unsqueeze(0),
-            full_k.unsqueeze(0),
-            full_v.unsqueeze(0),
-        )
+        if is_causal and cache_len > 0:
+            # PyTorch SDPA's ``is_causal=True`` with ``Q != K`` uses
+            # ``tril(diagonal=0)`` — top-left aligned, so for Q=1 against a
+            # long cache only ``q_0 -> k_0`` is unmasked (degenerate
+            # generate_text output).  Build the correct bottom-right
+            # aligned mask manually: ``mask[i, j] = -inf if j > cache_len
+            # + i`` so each new query attends to all of ``cache + self
+            # up to i``.  Bypass ``DiffusionAttention`` entirely — its
+            # ``_maybe_reshape_attn_mask`` helper only handles 2-D
+            # ``(B, K)`` shape, not ``(Q, K)``, so the reshape path
+            # silently drops the per-query mask for Q>1.
+            Q_len = q.shape[0]
+            K_len = full_k.shape[0]
+            arange_q = torch.arange(Q_len, device=q.device).unsqueeze(1)
+            arange_k = torch.arange(K_len, device=q.device).unsqueeze(0)
+            mask = arange_k > (cache_len + arange_q)  # (Q, K) bool
+            attn_bias = torch.zeros(Q_len, K_len, dtype=q.dtype, device=q.device)
+            attn_bias.masked_fill_(mask, float("-inf"))
+            # Permute to (B=1, H, S, D) for SDPA.
+            q_4d = q.unsqueeze(0).permute(0, 2, 1, 3)
+            k_4d = full_k.unsqueeze(0).permute(0, 2, 1, 3)
+            v_4d = full_v.unsqueeze(0).permute(0, 2, 1, 3)
+            attn_out_4d = torch.nn.functional.scaled_dot_product_attention(
+                q_4d,
+                k_4d,
+                v_4d,
+                attn_mask=attn_bias.unsqueeze(0).unsqueeze(0),  # (1, 1, Q, K)
+                dropout_p=0.0,
+                is_causal=False,
+                scale=1.0 / (self.head_dim**0.5),
+                enable_gqa=(self.num_heads != self.num_kv_heads),
+            )
+            attn_out = attn_out_4d.permute(0, 2, 1, 3)
+        else:
+            attn = self.attn_causal if is_causal else self.attn_noncausal
+            attn_out = attn(
+                q.unsqueeze(0),
+                full_k.unsqueeze(0),
+                full_v.unsqueeze(0),
+            )
 
         attn_out = attn_out.squeeze(0).reshape(-1, self.q_size)
         attn_out, _ = self.o_proj(attn_out)
