@@ -632,6 +632,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         req_id = session.request_id
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
+        session.discard_latest_async_tokens = False
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
         if outstanding_async_tokens > 0:
             # Async scheduling may already have sampled the previous
